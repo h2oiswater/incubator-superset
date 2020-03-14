@@ -52,6 +52,7 @@ import Iframe from '../explore/controlPanels/Iframe';
 import Line from '../explore/controlPanels/Line';
 import LineMulti from '../explore/controlPanels/LineMulti';
 import Mapbox from '../explore/controlPanels/Mapbox';
+import EChartsBarYCategoryStack from '../explore/controlPanels/EChartsBarYCategoryStack';
 import Markup from '../explore/controlPanels/Markup';
 import PairedTtest from '../explore/controlPanels/PairedTtest';
 import Para from '../explore/controlPanels/Para';
@@ -97,6 +98,7 @@ export default function setupPlugins() {
     .registerValue('line', Line)
     .registerValue('line_multi', LineMulti)
     .registerValue('mapbox', Mapbox)
+    .registerValue('echarts_bar_y_category_stack', EChartsBarYCategoryStack)
     .registerValue('markup', Markup)
     .registerValue('paired_ttest', PairedTtest)
     .registerValue('para', Para)
