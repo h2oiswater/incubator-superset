@@ -915,125 +915,188 @@ class EChartsBarYCategoryStack(BaseViz):
 
     viz_type = "echarts_bar_y_category_stack"
     verbose_name =_("ECharts堆叠条形图")
-    is_timeseries = False
 
-    def query_obj(self):
-        d = super().query_obj()
-        fd = self.form_data
-        label_col = fd.get("mapbox_label")
+    sort_series = False
+    is_timeseries = True
+    pivot_fill_value: Optional[int] = None
 
-        if not fd.get("groupby"):
-            if fd.get("all_columns_x") is None or fd.get("all_columns_y") is None:
-                raise Exception(_("[Longitude] and [Latitude] must be set"))
-            d["columns"] = [fd.get("all_columns_x"), fd.get("all_columns_y")]
+    def to_series(self, df, classed="", title_suffix=""):
+        cols = []
+        for col in df.columns:
+            if col == "":
+                cols.append("N/A")
+            elif col is None:
+                cols.append("NULL")
+            else:
+                cols.append(col)
+        df.columns = cols
+        series = df.to_dict("series")
 
-            if label_col and len(label_col) >= 1:
-                if label_col[0] == "count":
-                    raise Exception(
-                        _(
-                            "Must have a [Group By] column to have 'count' as the "
-                            + "[Label]"
-                        )
-                    )
-                d["columns"].append(label_col[0])
-
-            if fd.get("point_radius") != "Auto":
-                d["columns"].append(fd.get("point_radius"))
-
-            d["columns"] = list(set(d["columns"]))
-        else:
-            # Ensuring columns chosen are all in group by
+        chart_data = []
+        for name in df.T.index.tolist():
+            ys = series[name]
+            if df[name].dtype.kind not in "biufc":
+                continue
+            if isinstance(name, list):
+                series_title = [str(title) for title in name]
+            elif isinstance(name, tuple):
+                series_title = tuple(str(title) for title in name)
+            else:
+                series_title = str(name)
             if (
-                label_col
-                and len(label_col) >= 1
-                and label_col[0] != "count"
-                and label_col[0] not in fd.get("groupby")
+                    isinstance(series_title, (list, tuple))
+                    and len(series_title) > 1
+                    and len(self.metric_labels) == 1
             ):
-                raise Exception(_("Choice of [Label] must be present in [Group By]"))
+                # Removing metric from series name if only one metric
+                series_title = series_title[1:]
+            if title_suffix:
+                if isinstance(series_title, str):
+                    series_title = (series_title, title_suffix)
+                elif isinstance(series_title, (list, tuple)):
+                    series_title = series_title + (title_suffix,)
 
-            if fd.get("point_radius") != "Auto" and fd.get(
-                "point_radius"
-            ) not in fd.get("groupby"):
-                raise Exception(
-                    _("Choice of [Point Radius] must be present in [Group By]")
-                )
+            values = []
+            non_nan_cnt = 0
+            for ds in df.index:
+                if ds in ys:
+                    d = {"x": ds, "y": ys[ds]}
+                    if not np.isnan(ys[ds]):
+                        non_nan_cnt += 1
+                else:
+                    d = {}
+                values.append(d)
 
-            if fd.get("all_columns_x") not in fd.get("groupby") or fd.get(
-                "all_columns_y"
-            ) not in fd.get("groupby"):
+            if non_nan_cnt == 0:
+                continue
+
+            d = {"key": series_title, "values": values}
+            if classed:
+                d["classed"] = classed
+            chart_data.append(d)
+        return chart_data
+
+    def process_data(self, df: pd.DataFrame, aggregate: bool = False) -> VizData:
+        fd = self.form_data
+        if fd.get("granularity") == "all":
+            raise Exception(_("Pick a time granularity for your time series"))
+
+        if df.empty:
+            return df
+
+        if aggregate:
+            df = df.pivot_table(
+                index=DTTM_ALIAS,
+                columns=fd.get("groupby"),
+                values=self.metric_labels,
+                fill_value=0,
+                aggfunc=sum,
+            )
+        else:
+            df = df.pivot_table(
+                index=DTTM_ALIAS,
+                columns=fd.get("groupby"),
+                values=self.metric_labels,
+                fill_value=self.pivot_fill_value,
+            )
+
+        rule = fd.get("resample_rule")
+        method = fd.get("resample_method")
+
+        if rule and method:
+            df = getattr(df.resample(rule), method)()
+
+        if self.sort_series:
+            dfs = df.sum()
+            dfs.sort_values(ascending=False, inplace=True)
+            df = df[dfs.index]
+
+        df = self.apply_rolling(df)
+        if fd.get("contribution"):
+            dft = df.T
+            df = (dft / dft.sum()).T
+
+        return df
+
+    def run_extra_queries(self):
+        fd = self.form_data
+
+        time_compare = fd.get("time_compare") or []
+        # backwards compatibility
+        if not isinstance(time_compare, list):
+            time_compare = [time_compare]
+
+        for option in time_compare:
+            query_object = self.query_obj()
+            delta = utils.parse_past_timedelta(option)
+            query_object["inner_from_dttm"] = query_object["from_dttm"]
+            query_object["inner_to_dttm"] = query_object["to_dttm"]
+
+            if not query_object["from_dttm"] or not query_object["to_dttm"]:
                 raise Exception(
                     _(
-                        "[Longitude] and [Latitude] columns must be present in "
-                        + "[Group By]"
+                        "`Since` and `Until` time bounds should be specified "
+                        "when using the `Time Shift` feature."
                     )
                 )
-        return d
+            query_object["from_dttm"] -= delta
+            query_object["to_dttm"] -= delta
+
+            df2 = self.get_df_payload(query_object, time_compare=option).get("df")
+            if df2 is not None and DTTM_ALIAS in df2:
+                label = "{} offset".format(option)
+                df2[DTTM_ALIAS] += delta
+                df2 = self.process_data(df2)
+                self._extra_chart_data.append((label, df2))
 
     def get_data(self, df: pd.DataFrame) -> VizData:
-        if df.empty:
-            return None
         fd = self.form_data
-        label_col = fd.get("mapbox_label")
-        has_custom_metric = label_col is not None and len(label_col) > 0
-        metric_col = [None] * len(df.index)
-        if has_custom_metric:
-            if label_col[0] == fd.get("all_columns_x"):  # type: ignore
-                metric_col = df[fd.get("all_columns_x")]
-            elif label_col[0] == fd.get("all_columns_y"):  # type: ignore
-                metric_col = df[fd.get("all_columns_y")]
-            else:
-                metric_col = df[label_col[0]]  # type: ignore
-        point_radius_col = (
-            [None] * len(df.index)
-            if fd.get("point_radius") == "Auto"
-            else df[fd.get("point_radius")]
-        )
+        comparison_type = fd.get("comparison_type") or "values"
+        df = self.process_data(df)
+        if comparison_type == "values":
+            # Filter out series with all NaN
+            chart_data = self.to_series(df.dropna(axis=1, how="all"))
 
-        # limiting geo precision as long decimal values trigger issues
-        # around json-bignumber in Mapbox
-        GEO_PRECISION = 10
-        # using geoJSON formatting
-        geo_json = {
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "properties": {"metric": metric, "radius": point_radius},
-                    "geometry": {
-                        "type": "Point",
-                        "coordinates": [
-                            round(lon, GEO_PRECISION),
-                            round(lat, GEO_PRECISION),
-                        ],
-                    },
-                }
-                for lon, lat, metric, point_radius in zip(
-                    df[fd.get("all_columns_x")],
-                    df[fd.get("all_columns_y")],
-                    metric_col,
-                    point_radius_col,
+            for i, (label, df2) in enumerate(self._extra_chart_data):
+                chart_data.extend(
+                    self.to_series(
+                        df2, classed="time-shift-{}".format(i), title_suffix=label
+                    )
                 )
-            ],
-        }
+        else:
+            chart_data = []
+            for i, (label, df2) in enumerate(self._extra_chart_data):
+                # reindex df2 into the df2 index
+                combined_index = df.index.union(df2.index)
+                df2 = (
+                    df2.reindex(combined_index)
+                        .interpolate(method="time")
+                        .reindex(df.index)
+                )
 
-        x_series, y_series = df[fd.get("all_columns_x")], df[fd.get("all_columns_y")]
-        south_west = [x_series.min(), y_series.min()]
-        north_east = [x_series.max(), y_series.max()]
+                if comparison_type == "absolute":
+                    diff = df - df2
+                elif comparison_type == "percentage":
+                    diff = (df - df2) / df2
+                elif comparison_type == "ratio":
+                    diff = df / df2
+                else:
+                    raise Exception(
+                        "Invalid `comparison_type`: {0}".format(comparison_type)
+                    )
 
-        return {
-            "geoJSON": geo_json,
-            "hasCustomMetric": has_custom_metric,
-            "mapboxApiKey": config["MAPBOX_API_KEY"],
-            "mapStyle": fd.get("mapbox_style"),
-            "aggregatorName": fd.get("pandas_aggfunc"),
-            "clusteringRadius": fd.get("clustering_radius"),
-            "pointRadiusUnit": fd.get("point_radius_unit"),
-            "globalOpacity": fd.get("global_opacity"),
-            "bounds": [south_west, north_east],
-            "renderWhileDragging": fd.get("render_while_dragging"),
-            "tooltip": fd.get("rich_tooltip"),
-            "color": fd.get("mapbox_color"),
-        }
+                # remove leading/trailing NaNs from the time shift difference
+                diff = diff[diff.first_valid_index(): diff.last_valid_index()]
+
+                chart_data.extend(
+                    self.to_series(
+                        diff, classed="time-shift-{}".format(i), title_suffix=label
+                    )
+                )
+
+        if not self.sort_series:
+            chart_data = sorted(chart_data, key=lambda x: tuple(x["key"]))
+        return chart_data
 
 
 class NVD3Viz(BaseViz):
