@@ -178,6 +178,26 @@ class BaseViz:
         """
         pass
 
+    def apply_rolling(self, df):
+        fd = self.form_data
+        rolling_type = fd.get("rolling_type")
+        rolling_periods = int(fd.get("rolling_periods") or 0)
+        min_periods = int(fd.get("min_periods") or 0)
+
+        if rolling_type in ("mean", "std", "sum") and rolling_periods:
+            kwargs = dict(window=rolling_periods, min_periods=min_periods)
+            if rolling_type == "mean":
+                df = df.rolling(**kwargs).mean()
+            elif rolling_type == "std":
+                df = df.rolling(**kwargs).std()
+            elif rolling_type == "sum":
+                df = df.rolling(**kwargs).sum()
+        elif rolling_type == "cumsum":
+            df = df.cumsum()
+        if min_periods:
+            df = df[min_periods:]
+        return df
+
     def get_samples(self):
         query_obj = self.query_obj()
         query_obj.update(
@@ -383,10 +403,7 @@ class BaseViz:
 
         df = payload.get("df")
         if self.status != utils.QueryStatus.FAILED:
-            if df is not None and df.empty:
-                payload["error"] = "No data"
-            else:
-                payload["data"] = self.get_data(df)
+            payload["data"] = self.get_data(df)
         if "df" in payload:
             del payload["df"]
         return payload
@@ -651,6 +668,9 @@ class TimeTableViz(BaseViz):
         return d
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         fd = self.form_data
         columns = None
         values = self.metric_labels
@@ -704,6 +724,9 @@ class PivotTableViz(BaseViz):
         return d
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         if self.form_data.get("granularity") == "all" and DTTM_ALIAS in df:
             del df[DTTM_ALIAS]
 
@@ -825,6 +848,9 @@ class TreemapViz(BaseViz):
         return result
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         df = df.set_index(self.form_data.get("groupby"))
         chart_data = [
             {"name": metric, "children": self._nest(metric, df)}
@@ -895,6 +921,196 @@ class CalHeatmapViz(BaseViz):
         return d
 
 
+class EChartsBarYCategoryStack(BaseViz):
+
+    """class for ECharts - BarYCategoryStack"""
+
+    viz_type = "echarts_bar_y_category_stack"
+    verbose_name =_("ECharts堆叠条形图")
+
+    sort_series = False
+    is_timeseries = True
+    pivot_fill_value: Optional[int] = None
+
+    def to_series(self, df, classed="", title_suffix=""):
+        cols = []
+        for col in df.columns:
+            if col == "":
+                cols.append("N/A")
+            elif col is None:
+                cols.append("NULL")
+            else:
+                cols.append(col)
+        df.columns = cols
+        series = df.to_dict("series")
+
+        chart_data = []
+        for name in df.T.index.tolist():
+            ys = series[name]
+            if df[name].dtype.kind not in "biufc":
+                continue
+            if isinstance(name, list):
+                series_title = [str(title) for title in name]
+            elif isinstance(name, tuple):
+                series_title = tuple(str(title) for title in name)
+            else:
+                series_title = str(name)
+            if (
+                    isinstance(series_title, (list, tuple))
+                    and len(series_title) > 1
+                    and len(self.metric_labels) == 1
+            ):
+                # Removing metric from series name if only one metric
+                series_title = series_title[1:]
+            if title_suffix:
+                if isinstance(series_title, str):
+                    series_title = (series_title, title_suffix)
+                elif isinstance(series_title, (list, tuple)):
+                    series_title = series_title + (title_suffix,)
+
+            values = []
+            non_nan_cnt = 0
+            for ds in df.index:
+                if ds in ys:
+                    d = {"x": ds, "y": ys[ds]}
+                    if not np.isnan(ys[ds]):
+                        non_nan_cnt += 1
+                else:
+                    d = {}
+                values.append(d)
+
+            if non_nan_cnt == 0:
+                continue
+
+            d = {"key": series_title, "values": values}
+            if classed:
+                d["classed"] = classed
+            chart_data.append(d)
+        return chart_data
+
+    def process_data(self, df: pd.DataFrame, aggregate: bool = False) -> VizData:
+        fd = self.form_data
+        if fd.get("granularity") == "all":
+            raise Exception(_("Pick a time granularity for your time series"))
+
+        if df.empty:
+            return df
+
+        if aggregate:
+            df = df.pivot_table(
+                index=DTTM_ALIAS,
+                columns=fd.get("groupby"),
+                values=self.metric_labels,
+                fill_value=0,
+                aggfunc=sum,
+            )
+        else:
+            df = df.pivot_table(
+                index=DTTM_ALIAS,
+                columns=fd.get("groupby"),
+                values=self.metric_labels,
+                fill_value=self.pivot_fill_value,
+            )
+
+        rule = fd.get("resample_rule")
+        method = fd.get("resample_method")
+
+        if rule and method:
+            df = getattr(df.resample(rule), method)()
+
+        if self.sort_series:
+            dfs = df.sum()
+            dfs.sort_values(ascending=False, inplace=True)
+            df = df[dfs.index]
+
+        df = self.apply_rolling(df)
+        if fd.get("contribution"):
+            dft = df.T
+            df = (dft / dft.sum()).T
+
+        return df
+
+    def run_extra_queries(self):
+        fd = self.form_data
+
+        time_compare = fd.get("time_compare") or []
+        # backwards compatibility
+        if not isinstance(time_compare, list):
+            time_compare = [time_compare]
+
+        for option in time_compare:
+            query_object = self.query_obj()
+            delta = utils.parse_past_timedelta(option)
+            query_object["inner_from_dttm"] = query_object["from_dttm"]
+            query_object["inner_to_dttm"] = query_object["to_dttm"]
+
+            if not query_object["from_dttm"] or not query_object["to_dttm"]:
+                raise Exception(
+                    _(
+                        "`Since` and `Until` time bounds should be specified "
+                        "when using the `Time Shift` feature."
+                    )
+                )
+            query_object["from_dttm"] -= delta
+            query_object["to_dttm"] -= delta
+
+            df2 = self.get_df_payload(query_object, time_compare=option).get("df")
+            if df2 is not None and DTTM_ALIAS in df2:
+                label = "{} offset".format(option)
+                df2[DTTM_ALIAS] += delta
+                df2 = self.process_data(df2)
+                self._extra_chart_data.append((label, df2))
+
+    def get_data(self, df: pd.DataFrame) -> VizData:
+        fd = self.form_data
+        comparison_type = fd.get("comparison_type") or "values"
+        df = self.process_data(df)
+        if comparison_type == "values":
+            # Filter out series with all NaN
+            chart_data = self.to_series(df.dropna(axis=1, how="all"))
+
+            for i, (label, df2) in enumerate(self._extra_chart_data):
+                chart_data.extend(
+                    self.to_series(
+                        df2, classed="time-shift-{}".format(i), title_suffix=label
+                    )
+                )
+        else:
+            chart_data = []
+            for i, (label, df2) in enumerate(self._extra_chart_data):
+                # reindex df2 into the df2 index
+                combined_index = df.index.union(df2.index)
+                df2 = (
+                    df2.reindex(combined_index)
+                        .interpolate(method="time")
+                        .reindex(df.index)
+                )
+
+                if comparison_type == "absolute":
+                    diff = df - df2
+                elif comparison_type == "percentage":
+                    diff = (df - df2) / df2
+                elif comparison_type == "ratio":
+                    diff = df / df2
+                else:
+                    raise Exception(
+                        "Invalid `comparison_type`: {0}".format(comparison_type)
+                    )
+
+                # remove leading/trailing NaNs from the time shift difference
+                diff = diff[diff.first_valid_index(): diff.last_valid_index()]
+
+                chart_data.extend(
+                    self.to_series(
+                        diff, classed="time-shift-{}".format(i), title_suffix=label
+                    )
+                )
+
+        if not self.sort_series:
+            chart_data = sorted(chart_data, key=lambda x: tuple(x["key"]))
+        return chart_data
+
+
 class NVD3Viz(BaseViz):
 
     """Base class for all nvd3 vizs"""
@@ -935,6 +1151,9 @@ class BoxPlotViz(NVD3Viz):
         return chart_data
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         form_data = self.form_data
 
         # conform to NVD3 names
@@ -1022,6 +1241,9 @@ class BubbleViz(NVD3Viz):
         return d
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         df["x"] = df[[utils.get_metric_name(self.x_metric)]]
         df["y"] = df[[utils.get_metric_name(self.y_metric)]]
         df["size"] = df[[utils.get_metric_name(self.z_metric)]]
@@ -1100,6 +1322,18 @@ class BigNumberViz(BaseViz):
         d["metrics"] = [self.form_data.get("metric")]
         self.form_data["metric"] = metric
         return d
+
+    def get_data(self, df: pd.DataFrame) -> VizData:
+        df = df.pivot_table(
+            index=DTTM_ALIAS,
+            columns=[],
+            values=self.metric_labels,
+            fill_value=0,
+            aggfunc=sum,
+        )
+        df = self.apply_rolling(df)
+        df[DTTM_ALIAS] = df.index
+        return super().get_data(df)
 
 
 class BigNumberTotalViz(BaseViz):
@@ -1190,7 +1424,7 @@ class NVD3TimeSeriesViz(NVD3Viz):
             chart_data.append(d)
         return chart_data
 
-    def process_data(self, df, aggregate=False):
+    def process_data(self, df: pd.DataFrame, aggregate: bool = False) -> VizData:
         fd = self.form_data
         if fd.get("granularity") == "all":
             raise Exception(_("Pick a time granularity for your time series"))
@@ -1225,23 +1459,7 @@ class NVD3TimeSeriesViz(NVD3Viz):
             dfs.sort_values(ascending=False, inplace=True)
             df = df[dfs.index]
 
-        rolling_type = fd.get("rolling_type")
-        rolling_periods = int(fd.get("rolling_periods") or 0)
-        min_periods = int(fd.get("min_periods") or 0)
-
-        if rolling_type in ("mean", "std", "sum") and rolling_periods:
-            kwargs = dict(window=rolling_periods, min_periods=min_periods)
-            if rolling_type == "mean":
-                df = df.rolling(**kwargs).mean()
-            elif rolling_type == "std":
-                df = df.rolling(**kwargs).std()
-            elif rolling_type == "sum":
-                df = df.rolling(**kwargs).sum()
-        elif rolling_type == "cumsum":
-            df = df.cumsum()
-        if min_periods:
-            df = df[min_periods:]
-
+        df = self.apply_rolling(df)
         if fd.get("contribution"):
             dft = df.T
             df = (dft / dft.sum()).T
@@ -1415,6 +1633,9 @@ class NVD3DualLineViz(NVD3Viz):
         return chart_data
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         fd = self.form_data
 
         if self.form_data.get("granularity") == "all":
@@ -1451,6 +1672,9 @@ class NVD3TimePivotViz(NVD3TimeSeriesViz):
         return d
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         fd = self.form_data
         df = self.process_data(df)
         freq = to_offset(fd.get("freq"))
@@ -1509,6 +1733,8 @@ class DistributionPieViz(NVD3Viz):
     is_timeseries = False
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
         metric = self.metric_labels[0]
         df = df.pivot_table(index=self.groupby, values=[metric])
         df.sort_values(by=metric, ascending=False, inplace=True)
@@ -1550,6 +1776,9 @@ class HistogramViz(BaseViz):
 
     def get_data(self, df: pd.DataFrame) -> VizData:
         """Returns the chart data"""
+        if df.empty:
+            return None
+
         chart_data = []
         if len(self.groupby) > 0:
             groups = df.groupby(self.groupby)
@@ -1590,6 +1819,9 @@ class DistributionBarViz(DistributionPieViz):
         return d
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         fd = self.form_data
         metrics = self.metric_labels
         columns = fd.get("columns") or []
@@ -1756,6 +1988,9 @@ class ChordViz(BaseViz):
         return qry
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         df.columns = ["source", "target", "value"]
 
         # Preparing a symetrical matrix like d3.chords calls for
@@ -1919,7 +2154,7 @@ class IFrameViz(BaseViz):
         return pd.DataFrame()
 
     def get_data(self, df: pd.DataFrame) -> VizData:
-        return {}
+        return {"iframe": True}
 
 
 class ParallelCoordinatesViz(BaseViz):
@@ -1968,6 +2203,9 @@ class HeatmapViz(BaseViz):
         return d
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         fd = self.form_data
         x = fd.get("all_columns_x")
         y = fd.get("all_columns_y")
@@ -2077,6 +2315,7 @@ class MapboxViz(BaseViz):
     def get_data(self, df: pd.DataFrame) -> VizData:
         if df.empty:
             return None
+
         fd = self.form_data
         label_col = fd.get("mapbox_label")
         has_custom_metric = label_col is not None and len(label_col) > 0
@@ -2558,6 +2797,9 @@ class DeckArc(BaseDeckGLViz):
         }
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         d = super().get_data(df)
 
         return {
@@ -2619,6 +2861,10 @@ class PairedTTestViz(BaseViz):
             ], ...
         }
         """
+
+        if df.empty:
+            return None
+
         fd = self.form_data
         groups = fd.get("groupby")
         metrics = self.metric_labels
@@ -2659,6 +2905,9 @@ class RoseViz(NVD3TimeSeriesViz):
     is_timeseries = True
 
     def get_data(self, df: pd.DataFrame) -> VizData:
+        if df.empty:
+            return None
+
         data = super().get_data(df)
         result: Dict = {}
         for datum in data:  # type: ignore
