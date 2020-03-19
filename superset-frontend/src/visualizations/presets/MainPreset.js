@@ -44,6 +44,7 @@ import TreemapChartPlugin from '@superset-ui/legacy-plugin-chart-treemap';
 import WordCloudChartPlugin from '@superset-ui/legacy-plugin-chart-word-cloud';
 import WorldMapChartPlugin from '@superset-ui/legacy-plugin-chart-world-map';
 import EChartsBarYCategoryStack from '@apenga/echarts-bar-y-category-stack';
+import EChartsMixLineBar from '@apenga/echarts-mix-line-bar';
 
 // There is a known issue with bubble chart that the bubbles will not show up.
 // (<path d="NaN" />)
@@ -194,6 +195,9 @@ export default class MainPreset extends Preset {
         }),
         new EChartsBarYCategoryStack().configure({
           key: 'echarts_bar_y_category_stack',
+        }),
+        new EChartsMixLineBar().configure({
+          key: 'echarts_mix_line_bar',
         }),
       ],
     });

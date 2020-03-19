@@ -792,6 +792,18 @@ class WordCloudViz(BaseViz):
         return d
 
 
+class EChartsMixLineBar(BaseViz):
+
+    viz_type = "echarts_mix_line_bar"
+    verbose_name = _("ECharts Mix Line Bar")
+    is_timeseries = False
+
+    def query_obj(self):
+        d = super().query_obj()
+        d["groupby"] = [self.form_data.get("series")]
+        return d
+
+
 class TreemapViz(BaseViz):
 
     """Tree map visualisation for hierarchical data."""
