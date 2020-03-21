@@ -338,8 +338,8 @@ const config = {
     // and proxy everything else to Superset backend
     proxy: {
       context: () => true,
-      '/': `http://127.0.0.1:${supersetPort}`,
-      target: `http://127.0.0.1:${supersetPort}`,
+      '/': `http://localhost:${supersetPort}`,
+      target: `http://localhost:${supersetPort}`,
     },
     contentBase: path.join(process.cwd(), '../static/assets'),
   },
